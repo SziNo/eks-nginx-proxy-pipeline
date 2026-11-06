@@ -43,7 +43,7 @@ resource "aws_security_group" "node" {
 }
 
 # Security group az NLB-nek. Az azonosítóját az nlb_security_group_id output adja ki,
-# a scripts/render.sh pedig a generált overlay patch-ével beírja a Service annotációjába
+# a deploy (_deploy.yml, helyben a scripts/render.sh) név alapján kérdezi le, és patch-csel beírja a Service annotációjába
 # (service.beta.kubernetes.io/aws-load-balancer-security-groups).
 resource "aws_security_group" "nlb" {
   name        = "${var.cluster_name}-nlb"

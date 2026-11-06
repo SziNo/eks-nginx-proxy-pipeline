@@ -1,4 +1,4 @@
-# A scripts/ és a README ezekre a nevekre hivatkozik, ezért a nevek nem változtak.
+# A scripts/ és a README ezekre a nevekre hivatkozik.
 
 output "region" {
   description = "AWS régió (a scriptek ebből tudják, hol dolgozzanak)"
@@ -16,7 +16,7 @@ output "ecr_repository_urls" {
 }
 
 output "nlb_security_group_id" {
-  description = "Az NLB security groupja (a render.sh az overlay patch-ével a Service annotációjába írja)"
+  description = "Az NLB security groupja (a deploy és a render.sh név alapján kérdezi le, és patch-csel a Service annotációjába írja)"
   value       = module.eks.nlb_security_group_id
 }
 

@@ -80,11 +80,37 @@ variable "nlb_ingress_cidrs" {
 }
 
 variable "ecr_image_tag_mutability" {
-  description = "MUTABLE: ugyanaz a tag felülírható (gyakorláshoz); IMMUTABLE: egy tag csak egyszer tölthető fel (élesben ajánlott)"
+  description = "MUTABLE: ugyanaz a tag felülírható; IMMUTABLE: egy tag csak egyszer tölthető fel (a CI egyedi commit SHA tagekkel dolgozik, ezért IMMUTABLE)"
   type        = string
 }
 
 variable "ecr_force_delete" {
   description = "true: a repó akkor is törölhető, ha van benne image (gyakorláshoz, hogy a destroy lefusson); élesben false"
   type        = bool
+}
+
+variable "cluster_admin_principal_arns" {
+  description = "IAM user/role ARN-ek, amelyek cluster admin jogot kapnak (access entry, AmazonEKSClusterAdminPolicy, cluster scope): a saját IAM user, a terraform-apply és az app role. CI-ban a TF_VAR_cluster_admin_principal_arns variable-ből (JSON lista)."
+  type        = set(string)
+
+  validation {
+    condition     = length(var.cluster_admin_principal_arns) > 0
+    error_message = "Legalább egy cluster admin kell, különben a Helm provider sem éri el a clustert."
+  }
+
+  validation {
+    condition     = alltrue([for arn in var.cluster_admin_principal_arns : can(regex("^arn:aws:iam::[0-9]{12}:(user|role)/.+$", arn))])
+    error_message = "Minden elem IAM user vagy role ARN legyen (arn:aws:iam::<account>:user/... vagy :role/...)."
+  }
+}
+
+variable "cluster_plan_principal_arns" {
+  description = "IAM role ARN-ek, amelyek csak olvasási jogot kapnak a Helm release namespace-ében (AmazonEKSAdminViewPolicy, namespace scope): a terraform-plan role. CI-ban a TF_VAR_cluster_plan_principal_arns variable-ből (JSON lista)."
+  type        = set(string)
+  default     = []
+
+  validation {
+    condition     = alltrue([for arn in var.cluster_plan_principal_arns : can(regex("^arn:aws:iam::[0-9]{12}:(user|role)/.+$", arn))])
+    error_message = "Minden elem IAM user vagy role ARN legyen."
+  }
 }

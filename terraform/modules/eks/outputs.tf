@@ -34,7 +34,7 @@ output "node_security_group_id" {
 }
 
 output "nlb_security_group_id" {
-  description = "Az NLB security groupja (a render.sh az overlay patch-ével a Service annotációjába írja)"
+  description = "Az NLB security groupja (a deploy patch-csel a Service annotációjába írja)"
   value       = aws_security_group.nlb.id
 }
 

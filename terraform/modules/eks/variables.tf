@@ -49,8 +49,18 @@ variable "endpoint_public_access_cidrs" {
 }
 
 variable "cluster_admin_principal_arns" {
-  description = "IAM user/role ARN-ek, amelyek cluster admin jogot kapnak (access entry)"
+  description = "IAM user/role ARN-ek, amelyek cluster admin jogot kapnak (access entry, cluster scope)"
   type        = set(string)
+}
+
+variable "cluster_plan_principal_arns" {
+  description = "IAM role ARN-ek, amelyek csak olvashatnak a cluster_plan_namespace-ben (a terraform plan Helm refresh-éhez)"
+  type        = set(string)
+}
+
+variable "cluster_plan_namespace" {
+  description = "A namespace, amelyre a cluster_plan_principal_arns olvasási joga szól (a Helm release namespace-e)"
+  type        = string
 }
 
 variable "nlb_ingress_cidrs" {

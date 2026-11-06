@@ -1,4 +1,4 @@
-# ECR repók: ide tölti fel a scripts/build-push.sh a két alkalmazás image-ét, és innen
+# ECR repók: ide tölti fel a CI (_build.yml, helyben a scripts/build-push.sh) a két image-et, és innen
 # húzzák le a node-ok (a node szerep AmazonEC2ContainerRegistryReadOnly policyjával).
 # for_each a szolgáltatás nevével: stabil kulcs, egy repó törlése nem tolja el a többit (a count-tal ellentétben).
 # A repó neve "<előtag>/<szolgáltatás>" (pl. szino-nginx-proxy-demo/service-a): az ECR nevek fiókon belül

@@ -1,0 +1,35 @@
+# A production környezet NEM érzékeny, nem account-specifikus értékei (commitolt fájl).
+# Az account-specifikus és a bootstrapből jövő értékek (region, cluster_name, a két ARN lista)
+# TF_VAR_* környezeti változóként jönnek: CI-ban a GitHub Variables-ből, helyben a
+# gitignore-olt terraform.tfvars-ból. Használat: terraform plan -var-file=production.tfvars
+
+# Subnetek AZ-nként, kézzel rögzítve (nem data source-ból), így kiszámítható és nem változik magától.
+# A privát /20-asok nagyok, mert a VPC CNI miatt a podok is innen kapnak IP-t; a publikus /24-ekben
+# csak az NLB és a NAT gateway van. Minden CIDR-nek a vpc_cidr-be kell esnie, és nem fedhetik egymást.
+# Az AZ nevek a régióhoz kötődnek (eu-west-1).
+subnets = {
+  "eu-west-1a" = { private_cidr = "10.0.0.0/20", public_cidr = "10.0.48.0/24" }
+  "eu-west-1b" = { private_cidr = "10.0.16.0/20", public_cidr = "10.0.49.0/24" }
+  "eu-west-1c" = { private_cidr = "10.0.32.0/20", public_cidr = "10.0.50.0/24" }
+}
+
+kubernetes_version = "1.37"
+vpc_cidr           = "10.0.0.0/16"
+
+# Az AMI típusnak illeszkednie kell az instance típushoz (t3 = x86; egy t4g ARM lenne)
+node_instance_types = ["t3.medium"]
+node_ami_type       = "BOTTLEROCKET_x86_64"
+node_desired_size   = 3
+node_min_size       = 2
+node_max_size       = 4
+
+# Élesben szűkítsd; a GitHub-hosted runnerek IP-je nem fix, ezért a CI miatt nyitva marad
+cluster_endpoint_public_access_cidrs = ["0.0.0.0/0"]
+
+# Honnan érhető el az NLB (a 80-as port); nyilvános szolgáltatásnál az egész internet
+nlb_ingress_cidrs = ["0.0.0.0/0"]
+
+# ECR: a CI egyedi commit SHA tagekkel dolgozik, ezért egy tag soha nem íródik felül.
+# A force_delete true marad, hogy a destroy akkor is lefusson, ha vannak image-ek a repóban.
+ecr_image_tag_mutability = "IMMUTABLE"
+ecr_force_delete         = true

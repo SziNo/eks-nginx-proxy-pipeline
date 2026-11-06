@@ -1,55 +1,37 @@
 #!/usr/bin/env bash
-# Legenerálja a helyi overlay-t (k8s/overlays/local/kustomization.yaml) a Terraform
-# kimenetéből. A base (k8s/base/) érintetlen marad, ezért a szkript akárhányszor futtatható.
-# Használat: ./scripts/render.sh 1.0.0
+# A helyi overlay (k8s/overlays/local, gitignore-olt) előállítása, HELYI használatra.
+# A commitolt production overlay másolatán ugyanazokat a kustomize edit parancsokat futtatja,
+# mint a CI _deploy.yml-je, így a helyi és a CI-os telepítés nem tér el.
+# Használat (a projekt gyökeréből): ./scripts/render.sh [tag]   (alapból: git rev-parse HEAD)
+# Utána: kubectl apply -k k8s/overlays/local
 set -euo pipefail
+# shellcheck source=scripts/common.sh
+source "$(dirname "$0")/common.sh"
 
-TAG="${1:-1.0.0}"
-REGION="$(terraform -chdir=terraform output -raw region)"
-CLUSTER="$(terraform -chdir=terraform output -raw cluster_name)"
-ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
-SG_ID="$(terraform -chdir=terraform output -raw nlb_security_group_id)"
-# A repók címe: <regiszter>/<cluster_name>/<szolgáltatás>
-REPO_BASE="${ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com/${CLUSTER}"
+TAG="${1:-$(git rev-parse HEAD)}"
 
+tf_init
+load_tf_outputs || { echo "HIBA: üres a Terraform state, előbb kell az infrastruktúra." >&2; exit 1; }
+REGISTRY="$(ecr_registry)"
+SG_ID="$(nlb_sg_id)"
+if [[ "$SG_ID" != sg-* ]]; then
+  echo "HIBA: nem található a ${CLUSTER}-nlb security group." >&2
+  exit 1
+fi
+
+# Mindig friss másolat a production overlayről (a ../../base útvonal ugyanolyan mélységben érvényes),
+# így a script akárhányszor futtatható, és a commitolt fájl érintetlen marad.
 OVERLAY_DIR="k8s/overlays/local"
-mkdir -p "$OVERLAY_DIR"
+rm -rf "$OVERLAY_DIR"
+cp -r "$PRODUCTION_OVERLAY" "$OVERLAY_DIR"
 
-# A "cat >" minden futtatáskor teljesen felülírja a fájlt, így mindig az aktuális
-# értékek kerülnek bele. A heredoc-ban a bash behelyettesíti a ${...} változókat.
-cat > "${OVERLAY_DIR}/kustomization.yaml" <<EOF
-# GENERÁLT FÁJL, ne szerkeszd kézzel: a scripts/render.sh írja. Nincs a gitben.
-apiVersion: kustomize.config.k8s.io/v1beta1
-kind: Kustomization
-
-# A közös manifestek, környezetfüggő érték nélkül
-resources:
-- ../../base
-
-# Az "image: service-a" és "image: service-b" cseréje az ECR címre és a tagre.
-# A "name" a Deploymentben lévő image névre illeszkedik, ezért az nem változik.
-images:
-- name: service-a
-  newName: ${REPO_BASE}/service-a
-  newTag: "${TAG}"
-- name: service-b
-  newName: ${REPO_BASE}/service-b
-  newTag: "${TAG}"
-
-# Az NLB security group ID beírása a Service annotációjába (strategic merge patch).
-# Az ID minden terraform apply után más, ezért nem lehet a base-ben.
-patches:
-- target:
-    kind: Service
-    name: nginx-proxy
-  patch: |-
-    apiVersion: v1
-    kind: Service
-    metadata:
-      name: nginx-proxy
-      annotations:
-        service.beta.kubernetes.io/aws-load-balancer-security-groups: ${SG_ID}
-EOF
+cd "$OVERLAY_DIR"
+kustomize edit set image \
+  "service-a=${REGISTRY}/${CLUSTER}/service-a:${TAG}" \
+  "service-b=${REGISTRY}/${CLUSTER}/service-b:${TAG}"
+kustomize edit add patch --kind Service --name nginx-proxy \
+  --patch "[{\"op\":\"add\",\"path\":\"/metadata/annotations/service.beta.kubernetes.io~1aws-load-balancer-security-groups\",\"value\":\"${SG_ID}\"}]"
 
 echo "Generálva: ${OVERLAY_DIR}/kustomization.yaml (tag: ${TAG}, SG: ${SG_ID})"
 echo "Ellenőrzés: kubectl kustomize ${OVERLAY_DIR}"
+echo "Telepítés:  kubectl apply -k ${OVERLAY_DIR}"

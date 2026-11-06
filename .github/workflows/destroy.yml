@@ -1,0 +1,116 @@
+# A teljes alkalmazás és infrastruktúra lebontása, csak kézi indítással és megerősítéssel.
+# A sorrend: előbb a Kubernetes erőforrások (az NLB-t az AWS Load Balancer Controller hozta
+# létre, nem a Terraform, ezért a controllernek kell törölnie, amíg a cluster még létezik),
+# utána a terraform destroy. A bootstrapet (state bucket, GitHub Actions role-ok) és a GitHub
+# OIDC providert NEM bontja le.
+name: destroy
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Írd be: destroy'
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  destroy:
+    # Csak a pontos megerősítő szóval fut; minden más esetben a job kimarad.
+    if: inputs.confirm == 'destroy'
+    runs-on: ubuntu-24.04
+    environment: production
+    # Ugyanaz a csoport, mint az apply-é: a kettő soha nem fut egyszerre.
+    concurrency:
+      group: terraform-production
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write # OIDC token az AWS role felvételéhez
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      CLUSTER_NAME: ${{ vars.CLUSTER_NAME }}
+      NAMESPACE: demo
+      TF_IN_AUTOMATION: "true"
+      TF_INPUT: "false"
+      TF_VAR_region: ${{ vars.AWS_REGION }}
+      TF_VAR_cluster_name: ${{ vars.CLUSTER_NAME }}
+      TF_VAR_cluster_admin_principal_arns: ${{ vars.TF_VAR_cluster_admin_principal_arns }}
+      TF_VAR_cluster_plan_principal_arns: ${{ vars.TF_VAR_cluster_plan_principal_arns }}
+    steps:
+      # A manifestek (a törléshez a k8s/base elég: a delete csak a neveket nézi) és a Terraform kód.
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # OIDC: a terraform-apply role (cluster admin a Kubernetesben, és a destroyhoz is ez kell).
+      - name: Configure AWS credentials (terraform-apply role)
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.TF_APPLY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      # A cluster verziójához illő kubectl.
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@bda439f5f36b99b262ebdcd3613869bddb064c8e # v5.2.0
+        with:
+          version: v1.37.2
+
+      # Ugyanaz a Terraform verzió, mint a required_version.
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: "1.16.4"
+          terraform_wrapper: false
+
+      # Létezik még a cluster? Ha nem (pl. egy félbeszakadt destroy után), a Kubernetes lépések kimaradnak.
+      - name: Check cluster
+        id: cluster
+        run: |
+          if aws eks describe-cluster --name "$CLUSTER_NAME" --region "$AWS_REGION" >/dev/null 2>&1; then
+            aws eks update-kubeconfig --name "$CLUSTER_NAME" --region "$AWS_REGION"
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "A cluster nem létezik, a Kubernetes lépések kimaradnak."
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Az NLB ARN-je a Service hostnevéből, MIELŐTT a Service törlődik (utána már nem kérdezhető le).
+      - name: Find NLB
+        id: nlb
+        if: steps.cluster.outputs.exists == 'true'
+        run: |
+          host=$(kubectl -n "$NAMESPACE" get service nginx-proxy \
+            -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' --ignore-not-found)
+          arn=""
+          if [ -n "$host" ]; then
+            arn=$(aws elbv2 describe-load-balancers \
+              --query "LoadBalancers[?DNSName=='${host}'].LoadBalancerArn" --output text)
+          fi
+          echo "arn=${arn}" >> "$GITHUB_OUTPUT"
+          echo "NLB: ${host:-nincs} ${arn}"
+
+      # A kubectl parancs: az alkalmazás törlése. A --wait a Service controller finalizere miatt
+      # csak akkor tér vissza, amikor a controller már törölte az NLB-t és a target groupokat.
+      - name: kubectl delete
+        if: steps.cluster.outputs.exists == 'true'
+        run: kubectl delete -k k8s/base --ignore-not-found --wait=true --timeout=10m
+
+      # Biztonsági ellenőrzés az AWS oldalon: megvárja, amíg az NLB ténylegesen eltűnik, különben a
+      # terraform destroy elakadna a VPC-n (a gazdátlan NLB ENI-jei miatt).
+      - name: Wait for NLB deletion
+        if: steps.nlb.outputs.arn != ''
+        env:
+          NLB_ARN: ${{ steps.nlb.outputs.arn }}
+        run: aws elbv2 wait load-balancers-deleted --load-balancer-arns "$NLB_ARN"
+
+      # Partial backend configuration, mint az apply-nál.
+      - name: Terraform init
+        working-directory: terraform
+        run: terraform init -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" -lockfile=readonly
+
+      # Minden más (EKS, VPC, NAT, ECR, IAM) lebontása.
+      - name: Terraform destroy
+        working-directory: terraform
+        run: terraform destroy -var-file=production.tfvars -auto-approve -no-color -lock-timeout=10m

@@ -1,0 +1,103 @@
+# Terraform apply a main ágon, majd build és deploy ugyanazzal a commit SHA-val.
+# Az apply után mindig buildel és deployol, hogy egy friss (vagy újraépített) infrastruktúrán
+# is legyen futó alkalmazás. A paths szűrőben a hívott workflow-k is benne vannak; a
+# build-and-push.yml ugyanezt a listát figyeli, és ilyenkor nem fut párhuzamosan vele.
+name: terraform-apply
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "terraform/**"
+      - ".github/workflows/terraform-apply.yml"
+      - ".github/workflows/_build.yml"
+      - ".github/workflows/_deploy.yml"
+  workflow_dispatch:
+
+# Alapból csak olvasás; a jobok szükség szerint bővítik.
+permissions:
+  contents: read
+
+jobs:
+  # Az infrastruktúra frissítése. A plan-t a PR-ban néztük át, ezért itt -auto-approve.
+  apply:
+    runs-on: ubuntu-24.04
+    # production environment: csak a main ágról, és a terraform-apply role trust policyja erre szól.
+    environment: production
+    # Egyszerre egy Terraform futás (apply vagy destroy); a következő megvárja, nem szakítja meg
+    # (egy félbeszakított apply félkész infrastruktúrát és zárolt state-et hagyna).
+    concurrency:
+      group: terraform-production
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write # OIDC token az AWS role felvételéhez
+    defaults:
+      run:
+        working-directory: terraform
+    env:
+      TF_IN_AUTOMATION: "true"
+      TF_INPUT: "false"
+      # Az account-specifikus értékek a GitHub Variables-ből (a bootstrap állítja be)
+      TF_VAR_region: ${{ vars.AWS_REGION }}
+      TF_VAR_cluster_name: ${{ vars.CLUSTER_NAME }}
+      TF_VAR_cluster_admin_principal_arns: ${{ vars.TF_VAR_cluster_admin_principal_arns }}
+      TF_VAR_cluster_plan_principal_arns: ${{ vars.TF_VAR_cluster_plan_principal_arns }}
+    steps:
+      # A main ág aktuális commitja.
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # OIDC: rövid életű AWS kulcsok a terraform-apply role-lal, access key nélkül.
+      - name: Configure AWS credentials (terraform-apply role)
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.TF_APPLY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      # Ugyanaz a Terraform verzió, mint a required_version.
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: "1.16.4"
+          terraform_wrapper: false
+
+      # Partial backend configuration: a bucket nevét a TF_STATE_BUCKET variable adja.
+      - name: Terraform init
+        run: terraform init -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" -lockfile=readonly
+
+      # Az apply. A lock-timeout miatt egy éppen futó másik művelet zárolását kivárja.
+      - name: Terraform apply
+        run: terraform apply -var-file=production.tfvars -auto-approve -no-color -lock-timeout=10m
+
+      # A fontosabb outputok a job summary-ba.
+      - name: Job summary
+        run: |
+          {
+            echo "### Terraform apply"
+            echo '```'
+            terraform output -no-color
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # Build és push az apply UTÁN (needs), a jelenlegi commit SHA-val. Ha a tag már létezik
+  # az ECR-ben, a _build.yml kihagyja.
+  build:
+    needs: apply
+    uses: ./.github/workflows/_build.yml
+    permissions:
+      contents: read
+      id-token: write
+    with:
+      push: true
+      image_tag: ${{ github.sha }}
+
+  # Deploy a build UTÁN (needs), ugyanazzal a taggel.
+  deploy:
+    needs: build
+    uses: ./.github/workflows/_deploy.yml
+    permissions:
+      contents: read
+      id-token: write
+    with:
+      image_tag: ${{ github.sha }}

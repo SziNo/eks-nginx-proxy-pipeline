@@ -1,0 +1,134 @@
+# Az alkalmazás CI/CD-je.
+# - push a main-re (src/, k8s/ vagy a build/deploy workflow-k változtak): build + push + deploy.
+#   Ha ugyanebben a pushban a terraform-apply.yml is elindul (terraform/ vagy az általa hívott
+#   workflow-k változtak), ez a workflow NEM buildel és NEM deployol: a terraform-apply.yml az
+#   apply UTÁN ugyanezzel a commit SHA-val buildel és deployol, így a sorrend garantált, és nincs
+#   versenyhelyzet ugyanarra az IMMUTABLE tagre.
+# - pull_request: csak build (push és AWS nélkül), ha a src/ változott. A pull_request triggeren
+#   nincs paths szűrő, mert a build-status kötelező status check (lásd terraform-plan.yml).
+# - workflow_dispatch: build + push + deploy a kiválasztott ág fejéről (a production environment
+#   miatt csak main).
+name: build-and-push
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "k8s/**"
+      - ".github/workflows/build-and-push.yml"
+      - ".github/workflows/_build.yml"
+      - ".github/workflows/_deploy.yml"
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Alapból csak olvasás; a hívott workflow-k jobjai szükség szerint bővítik (vagy szűkítik).
+permissions:
+  contents: read
+
+# PR-on a régebbi futás megszakítható; a main-en nem (a deploy concurrency-je amúgy is sorba állít).
+concurrency:
+  group: build-and-push-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # Mi változott? PR-on: a src/ a main-hez képest. Pushnál: a terraform-apply.yml paths szűrője
+  # a push előtti és utáni commit között (github.event.before..github.sha).
+  changes:
+    runs-on: ubuntu-24.04
+    outputs:
+      build: ${{ steps.diff.outputs.build }}
+    steps:
+      # A teljes history kell, különben a git diff nem találja a bázis (before / base) commitot.
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      # A döntés git diff-fel, harmadik féltől származó action nélkül.
+      - name: Detect changes
+        id: diff
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BEFORE_SHA: ${{ github.event.before }}
+          AFTER_SHA: ${{ github.sha }}
+        run: |
+          # A terraform-apply.yml push paths szűrője: ha ezek közül bármi változott, az a workflow
+          # is elindul, és az apply után ő buildel és deployol.
+          apply_paths=(terraform/ .github/workflows/terraform-apply.yml
+            .github/workflows/_build.yml .github/workflows/_deploy.yml)
+
+          case "$EVENT_NAME" in
+            pull_request)
+              if git diff --quiet "${BASE_SHA}...${HEAD_SHA}" -- src/ \
+                  .github/workflows/build-and-push.yml .github/workflows/_build.yml; then
+                build=false
+              else
+                build=true
+              fi
+              ;;
+            push)
+              if [[ "$BEFORE_SHA" =~ ^0+$ ]] || ! git cat-file -e "${BEFORE_SHA}^{commit}" 2>/dev/null; then
+                # Nincs összehasonlítható előző commit (pl. az ág első pusha): deployolunk.
+                echo "::warning::A push előtti commit nem elérhető, a terraform/ változását nem lehet ellenőrizni."
+                build=true
+              elif git diff --quiet "$BEFORE_SHA" "$AFTER_SHA" -- "${apply_paths[@]}"; then
+                build=true
+              else
+                echo "A pushban a terraform-apply.yml által figyelt fájlok is változtak: az buildel és deployol."
+                build=false
+              fi
+              ;;
+            *)
+              build=true
+              ;;
+          esac
+          echo "build=${build}" >> "$GITHUB_OUTPUT"
+          echo "build: ${build}"
+
+  # Build: PR-on csak build (check job), egyébként build + push (push job, production environment).
+  build:
+    needs: changes
+    if: needs.changes.outputs.build == 'true'
+    uses: ./.github/workflows/_build.yml
+    permissions:
+      contents: read
+      id-token: write # csak a push job használja; a check job maga szűkíti contents: read-re
+    with:
+      push: ${{ github.event_name != 'pull_request' }}
+      image_tag: ${{ github.sha }}
+
+  # Deploy a frissen feltöltött commit SHA taggel (PR-on soha).
+  deploy:
+    needs: [changes, build]
+    if: needs.changes.outputs.build == 'true' && github.event_name != 'pull_request'
+    uses: ./.github/workflows/_deploy.yml
+    permissions:
+      contents: read
+      id-token: write
+    with:
+      image_tag: ${{ github.sha }}
+
+  # Gyűjtő job: ez a kötelező status check. A hívott workflow jobjainak neve futáskor más, mint
+  # kihagyáskor (build / check (service-a) vs. build), ezért a check egy stabil nevű jobra szól.
+  # Sikeres, ha a changes lefutott, és a build sikeres volt vagy nem kellett (skipped).
+  build-status:
+    needs: [changes, build]
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      # A függőségek eredményének ellenőrzése.
+      - name: Check results
+        env:
+          CHANGES: ${{ needs.changes.result }}
+          BUILD: ${{ needs.build.result }}
+        run: |
+          echo "changes: ${CHANGES}, build: ${BUILD}"
+          [ "$CHANGES" = "success" ] || exit 1
+          case "$BUILD" in
+            success | skipped) ;;
+            *) exit 1 ;;
+          esac

@@ -1,0 +1,8 @@
+# Dependabot: hetente PR-t nyit, ha a workflow-kban használt actionöknek új verziója jelent meg.
+# A SHA-ra rögzített actionöknél a SHA-t és a mellette lévő verzió kommentet is frissíti.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

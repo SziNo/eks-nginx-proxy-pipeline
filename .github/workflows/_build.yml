@@ -1,0 +1,129 @@
+# Újrahasznosítható build workflow (workflow_call), két külön jobbal:
+# - check: push nélkül, AWS és environment nélkül (PR-on a Dockerfile-ok ellenőrzése);
+# - push: production environmenttel (az app role trust policyja erre szól), ECR push.
+# A hívó a push inputtal választ; a kettő közül mindig csak az egyik fut.
+name: _build
+
+on:
+  workflow_call:
+    inputs:
+      push:
+        description: "true: build és push az ECR-be (production environment); false: csak build"
+        type: boolean
+        required: true
+      image_tag:
+        description: "Az image tag (a commit SHA)"
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  # Csak build (PR): ellenőrzi, hogy mindkét image felépül. Nincs AWS, nincs push.
+  check:
+    if: ${{ !inputs.push }}
+    name: check (${{ matrix.service }})
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [service-a, service-b]
+    steps:
+      # A forráskód (src/<szolgáltatás>) a build contexthez.
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Buildx builder: ez kell a gha cache-hez és a platform megadásához.
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      # Build push nélkül. A cache-t csak olvassa (a main ág buildjeié), nem írja, hogy a PR-ok
+      # ne foglalják a cache helyét.
+      - name: Build (no push)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: src/${{ matrix.service }}
+          platforms: linux/amd64
+          push: false
+          tags: ${{ matrix.service }}:${{ inputs.image_tag }}
+          cache-from: type=gha,scope=${{ matrix.service }}
+
+  # Build és push az ECR-be, a commit SHA taggel.
+  push:
+    if: ${{ inputs.push }}
+    name: push (${{ matrix.service }})
+    runs-on: ubuntu-24.04
+    environment: production
+    permissions:
+      contents: read
+      id-token: write # OIDC token az app role felvételéhez
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [service-a, service-b]
+    env:
+      REPOSITORY: ${{ vars.CLUSTER_NAME }}/${{ matrix.service }}
+      IMAGE_TAG: ${{ inputs.image_tag }}
+    steps:
+      # A forráskód (src/<szolgáltatás>) a build contexthez.
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # OIDC: rövid életű AWS kulcsok az app role-lal, access key nélkül.
+      - name: Configure AWS credentials (app role)
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.APP_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      # docker login az ECR registrybe; a registry címe (<account>.dkr.ecr.<régió>.amazonaws.com) az outputja.
+      - name: Login to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
+
+      # A repó IMMUTABLE: egy már feltöltött tag újbóli push-a hibát adna. Ha a tag megvan
+      # (pl. újrafuttatás, vagy a terraform-apply.yml ugyanazt a commitot buildeli), a build kimarad.
+      # Erre nincs action, ezért AWS CLI; csak az ImageNotFoundException jelenti, hogy nincs meg.
+      - name: Check if tag exists
+        id: tag
+        run: |
+          if out=$(aws ecr describe-images --repository-name "$REPOSITORY" \
+              --image-ids imageTag="$IMAGE_TAG" 2>&1); then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "${REPOSITORY}:${IMAGE_TAG} már létezik, a build kimarad."
+          elif grep -q ImageNotFoundException <<<"$out"; then
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "$out" >&2
+            exit 1
+          fi
+
+      # Buildx builder: ez kell a gha cache-hez és a platform megadásához.
+      - name: Set up Docker Buildx
+        if: steps.tag.outputs.exists == 'false'
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      # Build linux/amd64-re (a node-ok x86-osak) és push. A gha cache szolgáltatásonként külön
+      # scope-ban van, hogy a két image ne írja felül egymás cache-ét.
+      - name: Build and push
+        if: steps.tag.outputs.exists == 'false'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: src/${{ matrix.service }}
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.ecr.outputs.registry }}/${{ env.REPOSITORY }}:${{ env.IMAGE_TAG }}
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
+
+      # A feltöltött (vagy már meglévő) image a job summary-ba.
+      - name: Job summary
+        env:
+          EXISTS: ${{ steps.tag.outputs.exists }}
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          if [ "$EXISTS" = "true" ]; then status="már létezett, kimaradt"; else status="feltöltve"; fi
+          echo "- \`${REGISTRY}/${REPOSITORY}:${IMAGE_TAG}\`: ${status}" >> "$GITHUB_STEP_SUMMARY"

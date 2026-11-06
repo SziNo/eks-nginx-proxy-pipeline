@@ -12,12 +12,13 @@ override.tf.json
 *_override.tf
 *_override.tf.json
 
-# Terraform változóértékek: a valódi nem, a minta igen
+# Terraform változóértékek: a valódi (account-specifikus) nem, a minta és a production igen
 *.tfvars
 !*.tfvars.example
+!terraform/production.tfvars
 
-# Kubernetes: a render.sh által generált overlay
-k8s/overlays/
+# Kubernetes: a render.sh által generált helyi overlay (a production overlay commitolt)
+k8s/overlays/local/
 
 # Python
 __pycache__/

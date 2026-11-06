@@ -19,7 +19,7 @@ spec:
         runAsNonRoot: true
       containers:
         - name: app
-          image: service-b # a render.sh által generált overlay (k8s/overlays/local) "images" része cseréli az ECR címre és a tagre
+          image: service-b # a k8s/overlays/production "images" része cseréli az ECR címre és a commit SHA tagre
           ports:
             - containerPort: 8080
           readinessProbe:

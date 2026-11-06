@@ -1,0 +1,16 @@
+# A production overlay (commitolt). A környezetfüggő értékeket NEM tartalmazza (a repó publikus):
+# a deploy (_deploy.yml, helyben a scripts/render.sh) a workspace-ben, commit nélkül egészíti ki:
+#   kustomize edit set image service-a=<registry>/<cluster>/service-a:<commit SHA>   (és service-b)
+#   kustomize edit add patch ...   (az NLB security group ID a Service annotációjába)
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# A közös manifestek, környezetfüggő érték nélkül
+resources:
+  - ../../base
+
+# Az "image: service-a" és "image: service-b" cseréje. A "name" a Deploymentben lévő image
+# névre illeszkedik; a newName (ECR cím) és a newTag (commit SHA) a deploykor kerül ide.
+images:
+  - name: service-a
+  - name: service-b

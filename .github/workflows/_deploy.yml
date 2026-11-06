@@ -1,0 +1,145 @@
+# Újrahasznosítható deploy workflow (workflow_call): a k8s/overlays/production telepítése a
+# megadott image taggel (commit SHA), rollout ellenőrzés és smoke teszt az NLB-n keresztül.
+name: _deploy
+
+on:
+  workflow_call:
+    inputs:
+      image_tag:
+        description: "A telepítendő image tag (a commit SHA)"
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04
+    # production environment: csak a main ágról, és az app role trust policyja erre szól.
+    # Az url a GitHub Deployments oldalon az NLB címére mutat.
+    environment:
+      name: production
+      url: ${{ steps.nlb.outputs.url }}
+    # Egyszerre egy deploy; a következő megvárja az előzőt (nem szakítja meg).
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write # OIDC token az app role felvételéhez
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      CLUSTER_NAME: ${{ vars.CLUSTER_NAME }}
+      IMAGE_TAG: ${{ inputs.image_tag }}
+      NAMESPACE: demo
+      OVERLAY: k8s/overlays/production
+    steps:
+      # A manifestek (k8s/base és a production overlay).
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # OIDC: rövid életű AWS kulcsok az app role-lal; az aws-account-id output a registry címéhez kell.
+      - name: Configure AWS credentials (app role)
+        id: aws
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.APP_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      # A cluster verziójához illő kubectl (±1 alverzió támogatott).
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@bda439f5f36b99b262ebdcd3613869bddb064c8e # v5.2.0
+        with:
+          version: v1.37.2
+
+      # kubeconfig: a kubectl az aws eks get-token-nel hitelesít (az app role access entryje).
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --name "$CLUSTER_NAME" --region "$AWS_REGION"
+
+      # Az NLB security group ID-ja név alapján (a Terraform <cluster>-nlb néven hozza létre).
+      # Minden friss infrastruktúránál más, ezért nem lehet a commitolt overlayben.
+      - name: Look up NLB security group
+        id: sg
+        run: |
+          sg_id=$(aws ec2 describe-security-groups \
+            --filters "Name=group-name,Values=${CLUSTER_NAME}-nlb" \
+            --query 'SecurityGroups[0].GroupId' --output text)
+          if [[ "$sg_id" != sg-* ]]; then
+            echo "Nem található a ${CLUSTER_NAME}-nlb security group (fut a Terraform infrastruktúra?)" >&2
+            exit 1
+          fi
+          echo "id=${sg_id}" >> "$GITHUB_OUTPUT"
+          echo "NLB security group: ${sg_id}"
+
+      # Az overlay kiegészítése CSAK a workspace-ben (nem commitoljuk): az image-ek ECR címe és
+      # a commit SHA tag, valamint az SG ID a Service annotációjába (JSON6902 patch). A kustomize
+      # bináris a GitHub-hosted runner image része.
+      - name: Kustomize edit (image tag and NLB security group)
+        working-directory: ${{ env.OVERLAY }}
+        env:
+          REGISTRY: ${{ steps.aws.outputs.aws-account-id }}.dkr.ecr.${{ vars.AWS_REGION }}.amazonaws.com
+          SG_ID: ${{ steps.sg.outputs.id }}
+        run: |
+          kustomize edit set image \
+            "service-a=${REGISTRY}/${CLUSTER_NAME}/service-a:${IMAGE_TAG}" \
+            "service-b=${REGISTRY}/${CLUSTER_NAME}/service-b:${IMAGE_TAG}"
+          kustomize edit add patch --kind Service --name nginx-proxy \
+            --patch "[{\"op\":\"add\",\"path\":\"/metadata/annotations/service.beta.kubernetes.io~1aws-load-balancer-security-groups\",\"value\":\"${SG_ID}\"}]"
+          cat kustomization.yaml
+
+      # A kubectl parancs: a teljes overlay telepítése (namespace, ConfigMap, Deploymentek,
+      # DaemonSet, Service-ek).
+      - name: kubectl apply
+        run: kubectl apply -k "$OVERLAY"
+
+      # Megvárja, amíg az új podok mind ready-k (különben a deploy sikeresnek látszana, miközben
+      # pl. az image pull elbukik).
+      - name: Wait for rollout
+        run: |
+          for resource in deployment/service-a deployment/service-b daemonset/nginx-proxy; do
+            kubectl -n "$NAMESPACE" rollout status "$resource" --timeout=5m
+          done
+
+      # Megvárja, amíg az AWS Load Balancer Controller létrehozza az NLB-t, és a Service
+      # státuszába beírja a hostnevét (első telepítésnél ez pár perc).
+      - name: Wait for NLB hostname
+        id: nlb
+        run: |
+          kubectl -n "$NAMESPACE" wait service/nginx-proxy \
+            --for=jsonpath='{.status.loadBalancer.ingress[0].hostname}' --timeout=10m
+          host=$(kubectl -n "$NAMESPACE" get service nginx-proxy \
+            -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+          echo "host=${host}" >> "$GITHUB_OUTPUT"
+          echo "url=http://${host}" >> "$GITHUB_OUTPUT"
+          echo "NLB: ${host}"
+
+      # Smoke teszt a két útvonalra. Egy új NLB-nél a DNS és a target health pár percig tart,
+      # ezért a curl saját retry-a próbálkozik újra (minden hibánál, legfeljebb kb. 10 percig).
+      - name: Smoke test
+        env:
+          URL: ${{ steps.nlb.outputs.url }}
+        run: |
+          check() {
+            local path="$1" expected="$2" body
+            body=$(curl --fail --silent --show-error --max-time 10 \
+              --retry 40 --retry-delay 15 --retry-all-errors --retry-max-time 600 \
+              "${URL}${path}")
+            echo "${path}: ${body}"
+            grep -q "$expected" <<<"$body"
+          }
+          check /api/sa "Service A"
+          check /api/sb "Service B"
+
+      # Az NLB címe és a telepített image tag a job summary-ba.
+      - name: Job summary
+        env:
+          HOST: ${{ steps.nlb.outputs.host }}
+        run: |
+          {
+            echo "### Deploy"
+            echo "- Image tag: \`${IMAGE_TAG}\`"
+            echo "- NLB: \`${HOST}\`"
+            echo "- http://${HOST}/api/sa"
+            echo "- http://${HOST}/api/sb"
+          } >> "$GITHUB_STEP_SUMMARY"

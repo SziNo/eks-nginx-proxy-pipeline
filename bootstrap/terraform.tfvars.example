@@ -1,0 +1,9 @@
+# Másold terraform.tfvars névre és töltsd ki (a terraform.tfvars gitignore-olt).
+region       = "eu-west-1"
+cluster_name = "szino-nginx-proxy-demo" # az IAM nevek fiókszinten egyediek: legyen benne a neved
+
+github_owner      = "SziNo"
+github_repository = "eks-nginx-proxy-pipeline"
+
+# A saját IAM userem ARN-je: aws sts get-caller-identity --query Arn --output text
+admin_user_arn = "arn:aws:iam::123456789012:user/your-user"

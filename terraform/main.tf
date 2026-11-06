@@ -24,7 +24,7 @@ module "vpc" {
 }
 
 # EKS cluster: IAM szerepek, security groupok (az NLB-é is), cluster, addonok,
-# managed node group, OIDC provider és admin access entry.
+# managed node group, OIDC provider és access entryk (admin és a plan role olvasási joga).
 module "eks" {
   source = "./modules/eks"
 
@@ -43,8 +43,13 @@ module "eks" {
   endpoint_public_access_cidrs = var.cluster_endpoint_public_access_cidrs
   nlb_ingress_cidrs            = var.nlb_ingress_cidrs
 
-  # Aki a Terraformot futtatja (IAM user), cluster admin lesz
-  cluster_admin_principal_arns = [data.aws_caller_identity.current.arn]
+  # Cluster admin: a saját IAM user, a terraform-apply és az app role (a bootstrap adja meg
+  # a GitHub Variables-ben, helyben a terraform.tfvars-ban)
+  cluster_admin_principal_arns = var.cluster_admin_principal_arns
+
+  # A terraform-plan role csak a Helm release namespace-ében olvashat (a plan alatti refreshhez)
+  cluster_plan_principal_arns = var.cluster_plan_principal_arns
+  cluster_plan_namespace      = local.lb_controller_namespace
 }
 
 # AWS Load Balancer Controller: IRSA szerep + Helm release. Ez hozza létre az NLB-t
@@ -58,6 +63,7 @@ module "lb_controller" {
   oidc_provider_arn = module.eks.oidc_provider_arn
   oidc_provider_url = module.eks.oidc_provider_url
   chart_version     = var.lb_controller_chart_version
+  namespace         = local.lb_controller_namespace
 
   # A Helm release csak akkor induljon, ha az EKS modul MINDEN eleme kész: a node group
   # (különben a controller podjai nem tudnak elindulni) és az admin access entry
