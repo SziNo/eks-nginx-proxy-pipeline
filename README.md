@@ -93,12 +93,12 @@ Ha korábban helyi state-tel már futott ez a projekt, és az infrastruktúra á
 ### 3. Az első PR és merge
 
 ```bash
-git switch -c ci-pipeline
+git switch -c feature/pipeline
 git add -A && git commit -m "GitHub Actions CI/CD pipeline"
-git push -u origin ci-pipeline
+git push -u origin feature/pipeline
 ```
 
-PR a main-re a GitHubon. Lefut a `terraform-plan` (a plan kommentben: a teljes infrastruktúra létrehozása) és a `build-and-push` (push nélküli build). Ha a `plan-status` és a `build-status` zöld, mergeld. A main-en elindul a `terraform-apply.yml`: apply (kb. 15–20 perc), build, push, deploy. A `build-and-push.yml` ilyenkor nem deployol, mert a `terraform/` is változott. A deploy job summary-jában ott az NLB DNS neve.
+A push egy nem main ágra a bootstrap előtt is biztonságos (a workflow-k csak main pushra és main-re nyitott PR-ra indulnak), a PR-t viszont csak a bootstrap után nyisd meg. PR a main-re a GitHubon. Lefut a `terraform-plan` (a plan kommentben: a teljes infrastruktúra létrehozása) és a `build-and-push` (push nélküli build). Ha a `plan-status` és a `build-status` zöld, mergeld. A main-en elindul a `terraform-apply.yml`: apply (kb. 15–20 perc), build, push, deploy. A `build-and-push.yml` ilyenkor nem deployol, mert a `terraform/` is változott. A deploy job summary-jában ott az NLB DNS neve.
 
 ### 4. A napi munka
 
